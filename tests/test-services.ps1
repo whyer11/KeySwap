@@ -5,7 +5,7 @@ $testDirectory = Join-Path ([IO.Path]::GetTempPath()) ('KeySwap-services-' + [gu
 New-Item -ItemType Directory -Path $testDirectory | Out-Null
 try {
     $testExecutable = Join-Path $testDirectory 'AppServicesTests.exe'
-    & $compilerPath /nologo /target:exe /platform:x64 /codepage:65001 "/out:$testExecutable" /r:System.dll /r:System.Core.dll /r:System.Xml.dll /r:System.Windows.Forms.dll (Join-Path $repoRoot 'src\AppServices.cs') (Join-Path $PSScriptRoot 'AppServicesTests.cs')
+    & $compilerPath /nologo /target:exe /platform:x64 /codepage:65001 "/out:$testExecutable" /r:System.dll /r:System.Core.dll /r:System.Xml.dll /r:System.Windows.Forms.dll (Join-Path $repoRoot 'src\AppServices.cs') (Join-Path $repoRoot 'src\LegacyBridgeGuard.cs') (Join-Path $PSScriptRoot 'AppServicesTests.cs')
     if ($LASTEXITCODE -ne 0) { throw "Service test compilation failed: $LASTEXITCODE" }
     & $testExecutable
     if ($LASTEXITCODE -ne 0) { throw "Service tests failed: $LASTEXITCODE" }

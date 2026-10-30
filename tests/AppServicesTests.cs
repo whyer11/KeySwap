@@ -28,6 +28,51 @@ internal static class AppServicesTests
             Assert(!StartupOptions.Parse(new string[] { "--enable", "--disable" }, true, true).Enabled, "disable ignored");
             Assert(StartupOptions.Parse(new string[] { "--disable", "--enable" }, false, true).Enabled, "enable ignored");
         });
+        Test("bridge defaults remain opt-in and restore saved state", delegate {
+            Assert(!StartupOptions.Parse(new string[0], true, true).BridgeEnabled, "legacy launch unexpectedly enables the bridge");
+            Assert(StartupOptions.Parse(new string[0], true, true, true).BridgeEnabled, "saved bridge preference was ignored");
+            Assert(!StartupOptions.Parse(new string[0], true, true, false).BridgeEnabled, "saved disabled bridge preference was ignored");
+        });
+        Test("null arguments retain the saved bridge preference", delegate {
+            Assert(StartupOptions.Parse(null, true, true, true).BridgeEnabled, "null arguments lost saved enabled bridge state");
+            Assert(!StartupOptions.Parse(null, true, true, false).BridgeEnabled, "null arguments enabled the bridge");
+        });
+        Test("bridge arguments are case insensitive and last wins", delegate {
+            Assert(StartupOptions.Parse(new string[] { "--NO-BRIDGE", "--BRIDGE" }, true, true, false).BridgeEnabled, "last bridge enable ignored");
+            Assert(!StartupOptions.Parse(new string[] { "--BRIDGE", "--NO-BRIDGE" }, true, true, true).BridgeEnabled, "last bridge disable ignored");
+        });
+        Test("bridge and swap arguments are independent", delegate {
+            StartupOptions bridgeOnly = StartupOptions.Parse(new string[] { "--disable", "--bridge" }, true, true, false);
+            Assert(!bridgeOnly.Enabled && bridgeOnly.BridgeEnabled, "bridge could not run with swap disabled");
+            StartupOptions swapOnly = StartupOptions.Parse(new string[] { "--enable", "--no-bridge" }, false, true, true);
+            Assert(swapOnly.Enabled && !swapOnly.BridgeEnabled, "swap could not run with bridge disabled");
+        });
+        Test("legacy guard blocks a second bridge until the first is disposed", delegate {
+            string name = @"Local\KeySwap-GuardTest-" + Guid.NewGuid().ToString("N");
+            using (LegacyBridgeGuard first = new LegacyBridgeGuard(name))
+            using (LegacyBridgeGuard second = new LegacyBridgeGuard(name))
+            {
+                Assert(first.TryAcquire(), "first guard did not reserve the bridge");
+                Assert(first.TryAcquire(), "repeated acquire lost the existing reservation");
+                Assert(!second.TryAcquire(), "second guard permitted overlapping bridges");
+                Assert(!string.IsNullOrEmpty(second.LastError), "conflict did not provide a diagnostic");
+                first.Dispose();
+                Assert(second.TryAcquire(), "failed acquisition retained a handle after first guard was disposed");
+                Assert(string.IsNullOrEmpty(second.LastError), "successful retry retained the old error");
+            }
+            using (LegacyBridgeGuard third = new LegacyBridgeGuard(name))
+                Assert(third.TryAcquire(), "disposing the successful guard did not release the reservation");
+        });
+        Test("legacy guard never substitutes an unnamed mutex for missing identity", delegate {
+            foreach (string name in new string[] { null, "", " " })
+            {
+                using (LegacyBridgeGuard guard = new LegacyBridgeGuard(name))
+                {
+                    Assert(!guard.TryAcquire(), "missing identity bypassed process exclusion");
+                    Assert(!string.IsNullOrEmpty(guard.LastError), "invalid identity did not provide a diagnostic");
+                }
+            }
+        });
         Test("autostart task preserves settings and runs indefinitely on battery", delegate {
             string xml = AutoStartManager.BuildTaskXml(@"C:\Apps & Tools\KeySwap.exe", "S-1-5-21-1234");
             XmlDocument doc = new XmlDocument(); doc.LoadXml(xml);

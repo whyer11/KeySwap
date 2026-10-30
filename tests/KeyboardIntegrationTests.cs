@@ -17,6 +17,9 @@ internal static class KeyboardIntegrationTests
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder text, int size);
     [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr window, int index);
     private static readonly IntPtr ProbeMarker = new IntPtr(0x54455354);
     #if LEGACY
     private static readonly BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
@@ -44,7 +47,9 @@ internal static class KeyboardIntegrationTests
     [STAThread]
     private static int Main(string[] args)
     {
-        if (args.Length != 1 || (args[0] != "--desktop-probe" && args[0] != "--startup-probe"))
+        Console.OutputEncoding = Encoding.UTF8;
+        if (args.Length != 1 || (args[0] != "--desktop-probe" && args[0] != "--startup-probe"
+            && args[0] != "--window-probe" && args[0] != "--native-probe"))
         {
             Console.WriteLine("Opt-in required: --desktop-probe (temporarily sends Alt/Tab to two test windows).");
             return 2;
@@ -60,6 +65,12 @@ internal static class KeyboardIntegrationTests
                 Text = "KeySwap integration probe: this textbox intercepts Ctrl+C without changing the clipboard." };
             _a.Controls.Add(_text);
             _a.Show(); _b.Show(); Wait(300);
+            if (args[0] == "--window-probe")
+            {
+                PrepareWindows();
+                Console.WriteLine("WINDOW FIXTURE PASS");
+                return 0;
+            }
             #if !LEGACY
             if (args[0] == "--startup-probe")
             {
@@ -78,8 +89,16 @@ internal static class KeyboardIntegrationTests
                 return _failures == 0 ? 0 : 1;
             }
             #endif
+            watchdog = new System.Threading.Timer(delegate
+            {
+                Console.WriteLine("WATCHDOG: desktop probe exceeded 40 seconds; releasing probe keys.");
+                Release();
+                Thread.Sleep(150);
+                Environment.Exit(4);
+            }, null, 40000, Timeout.Infinite);
             Observe();
             Probe("native scan left Alt", false, 0, 8);
+            if (args[0] == "--native-probe") return _failures == 0 ? 0 : 1;
             #if LEGACY
             Probe("native virtual left Alt", false, 0xA4, 0);
             Probe("native virtual extended left Alt", false, 0xA4, 1);
@@ -111,6 +130,10 @@ internal static class KeyboardIntegrationTests
             ProbeStartWithNativeCtrlHeld();
             ProbeUiStall();
             ProbeShortcut("mapped shortcut after UI stall");
+            ProbePadBridge(true, false);
+            ProbePadBridge(false, false);
+            ProbePadBridge(true, true);
+            ProbePadWindowsKey();
             #endif
             Console.WriteLine("INTEGRATION failures=" + _failures + "; synthetic desktop input only; physical keyboard still needs user verification.");
             return _failures == 0 ? 0 : 1;
@@ -125,7 +148,7 @@ internal static class KeyboardIntegrationTests
             #else
             if (_subject != null) _subject.Stop();
             #endif
-            Release(); Wait(150);
+            if (args[0] != "--window-probe") { Release(); Wait(150); }
             if (_a != null) _a.Dispose();
             if (_b != null) _b.Dispose();
             SetForegroundWindow(original);
@@ -156,8 +179,7 @@ internal static class KeyboardIntegrationTests
     {
         Console.WriteLine("CASE " + title);
         Release(); Wait(150);
-        _b.Activate(); SetForegroundWindow(_b.Handle); Wait(250);
-        _a.Activate(); SetForegroundWindow(_a.Handle); Wait(300);
+        PrepareWindows();
         State("before");
         Check("test window A received foreground", GetForegroundWindow() == _a.Handle);
         IntPtr marker = throughSubject ? ProbeMarker : Native.MAGIC;
@@ -174,8 +196,7 @@ internal static class KeyboardIntegrationTests
     private static void Prepare()
     {
         Release(); Wait(100);
-        _b.Activate(); SetForegroundWindow(_b.Handle); Wait(150);
-        _a.Activate(); SetForegroundWindow(_a.Handle); _text.Focus(); Wait(200);
+        PrepareWindows(); _text.Focus(); Wait(200);
         Check("test window A received foreground", GetForegroundWindow() == _a.Handle);
     }
     private static void TapTab(IntPtr marker)
@@ -256,7 +277,83 @@ internal static class KeyboardIntegrationTests
         Check("native Ctrl release after Start reaches Windows", GetAsyncKeyState(0xA2) >= 0 && GetAsyncKeyState(0xA4) >= 0);
         ProbeShortcut("mapped shortcut resumes after pre-existing Ctrl is released");
     }
+
+    private static void ProbePadBridge(bool swap, bool rightAlt)
+    {
+        Console.WriteLine("CASE integrated Pad quick Alt/F12 release swap=" + swap + " rightAlt=" + rightAlt);
+        _subject.Stop(); Wait(100);
+        _subject.SwapEnabled = swap;
+        _subject.BridgeEnabled = true;
+        _subject.KeepAltTab = true;
+        Check("integrated bridge hook starts", _subject.Start());
+        Prepare();
+        uint extended = rightAlt ? 1U : 0U;
+        var batch = new Native.INPUT[4];
+        for (int i = 0; i < batch.Length; i++)
+        {
+            batch[i].type = 1;
+            batch[i].ki.wScan = (ushort)((i == 0 || i == 3) ? 0x38 : 0x58);
+            batch[i].ki.dwFlags = 8U | (i >= 2 ? 2U : 0U) | ((i == 0 || i == 3) ? extended : 0U);
+            batch[i].ki.dwExtraInfo = ProbeMarker;
+        }
+        Check("quick Pad input accepted", Native.SendInput(4, batch, Marshal.SizeOf(typeof(Native.INPUT))) == 4);
+        Wait(700);
+        State("quick encoded chord released");
+        Check("quick encoded chord switches to test window B", GetForegroundWindow() == _b.Handle);
+        Check("quick encoded chord releases all modifiers and Tab", GetAsyncKeyState(0xA4) >= 0
+            && GetAsyncKeyState(0xA5) >= 0 && GetAsyncKeyState(0xA2) >= 0 && GetAsyncKeyState(9) >= 0);
+        if (!rightAlt)
+        {
+            Prepare();
+            Send(0, 0x38, 8, ProbeMarker); Wait(100);
+            Send(0, 0x58, 8, ProbeMarker); Wait(100);
+            Send(0, 0x58, 10, ProbeMarker); Wait(100);
+            Check("encoded Tab release keeps Alt selection held", GetAsyncKeyState(0xA4) < 0 && GetAsyncKeyState(0xA2) >= 0);
+            Send(0, 0x38, 10, ProbeMarker); Wait(400);
+        }
+    }
+
+    private static void ProbePadWindowsKey()
+    {
+        Console.WriteLine("CASE Pad ScrollLock bridges a held extended Windows key");
+        Prepare();
+        Send(0, 0x46, 8, ProbeMarker); Wait(100);
+        Check("Pad Command holds native Windows key", GetAsyncKeyState(0x5B) < 0);
+        // Suppress the Start menu for this test-owned Win press without opening
+        // a system shortcut; Ctrl is held only while releasing Win.
+        Send(0, 0x1D, 8, Native.MAGIC);
+        Send(0, 0x46, 10, ProbeMarker); Wait(100);
+        Send(0, 0x1D, 10, Native.MAGIC); Wait(100);
+        Check("Pad Command release releases Windows key", GetAsyncKeyState(0x5B) >= 0);
+    }
     #endif
+    private static void PrepareWindows()
+    {
+        RequireForeground(_b);
+        RequireForeground(_a);
+    }
+    private static void RequireForeground(Form window)
+    {
+        window.Show();
+        bool accepted = false;
+        Stopwatch watch = Stopwatch.StartNew();
+        do
+        {
+            window.Activate();
+            accepted = SetForegroundWindow(window.Handle);
+            Wait(100);
+            if (IsWindowVisible(window.Handle) && GetForegroundWindow() == window.Handle)
+            {
+                Console.WriteLine("FIXTURE {0} hwnd={1:X} visible=True foreground=True owner={2:X} style={3:X} exstyle={4:X}",
+                    window.Text, window.Handle.ToInt64(), GetWindow(window.Handle, 4).ToInt64(),
+                    GetWindowLongPtr(window.Handle, -16).ToInt64(), GetWindowLongPtr(window.Handle, -20).ToInt64());
+                return;
+            }
+        } while (watch.ElapsedMilliseconds < 3000);
+        State("fixture failed");
+        throw new InvalidOperationException("Test window could not become visible foreground; no shortcut will be sent: "
+            + window.Text + "; visible=" + IsWindowVisible(window.Handle) + "; activation=" + accepted);
+    }
     private static void Check(string label, bool success)
     {
         Console.WriteLine((success ? "PASS " : "FAIL ") + label);
@@ -276,6 +373,9 @@ internal static class KeyboardIntegrationTests
         Send(0, 0x38, 11, Native.MAGIC);
         Send(0, 0x1D, 10, Native.MAGIC);
         Send(0, 0x2A, 10, Native.MAGIC);
+        Send(0, 0x58, 10, Native.MAGIC);
+        Send(0, 0x46, 10, Native.MAGIC);
+        Send(0, 0x5B, 11, Native.MAGIC);
     }
     private static void State(string phase)
     {

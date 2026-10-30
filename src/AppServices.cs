@@ -14,19 +14,23 @@ namespace KeySwap
     {
         public bool Enabled { get; private set; }
         public bool KeepAltTab { get; private set; }
+        public bool BridgeEnabled { get; private set; }
         public bool Tray { get; private set; }
         public bool LogKeys { get; private set; }
-        public static StartupOptions Parse(string[] args, bool savedEnabled, bool savedKeepAltTab)
+        public static StartupOptions Parse(string[] args, bool savedEnabled, bool savedKeepAltTab, bool savedBridge = false)
         {
             StartupOptions options = new StartupOptions();
             options.Enabled = savedEnabled;
             options.KeepAltTab = savedKeepAltTab;
+            options.BridgeEnabled = savedBridge;
             if (args == null) return options;
             foreach (string arg in args)
             {
                 if (string.Equals(arg, "--enable", StringComparison.OrdinalIgnoreCase)) options.Enabled = true;
                 else if (string.Equals(arg, "--disable", StringComparison.OrdinalIgnoreCase)) options.Enabled = false;
                 else if (string.Equals(arg, "--no-alttab", StringComparison.OrdinalIgnoreCase)) options.KeepAltTab = false;
+                else if (string.Equals(arg, "--bridge", StringComparison.OrdinalIgnoreCase)) options.BridgeEnabled = true;
+                else if (string.Equals(arg, "--no-bridge", StringComparison.OrdinalIgnoreCase)) options.BridgeEnabled = false;
                 else if (string.Equals(arg, "--tray", StringComparison.OrdinalIgnoreCase)) options.Tray = true;
                 else if (string.Equals(arg, "--logkeys", StringComparison.OrdinalIgnoreCase)) options.LogKeys = true;
             }

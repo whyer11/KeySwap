@@ -1,14 +1,20 @@
 # KeySwap
 
-原生 .NET Framework WinForms 键盘工具：交换左侧 Alt 与 Ctrl，同时保留物理左 Alt+Tab 的 Windows 窗口切换行为。右侧键不做直接映射。
+原生 .NET Framework WinForms 键盘工具：交换左侧 Alt 与 Ctrl，保留物理左 Alt+Tab 的 Windows 窗口切换，并内置小米 Pad 的 WorkBuddy Windows 桥接功能。一个程序、一套键盘钩子、一个托盘和一个登录自启任务。右侧 Ctrl/Alt 不做互换。
 
 ## 使用
 
-运行 `dist/KeySwap.exe`，首次默认启用互换。关闭窗口会进入托盘；右键托盘可暂停互换、切换 Alt+Tab 保留、管理登录自启或退出。重复启动会显示已有窗口。
+运行 `dist/KeySwap.exe`，首次默认启用互换。小米 Pad 用户可勾选“小米 Pad 键盘桥接”，启用远程 Alt+Tab 和 Command→Windows 键。互换与桥接可独立开关；关闭互换时，桥接仍可使用。关闭窗口会进入托盘；右键托盘可切换功能、管理登录自启、打开日志目录或退出。重复启动会显示已有窗口。
 
 开关保存在 `HKCU\Software\KeySwap`。登录自启使用当前用户的计划任务，带 `--tray` 参数，并恢复上次保存的开关。任务不因切换到电池或运行超过 72 小时而结束。
 
-参数：`--enable`、`--disable`、`--tray`、`--no-alttab`。排查问题时可用 `--logkeys`，只记录 Alt/Ctrl/Tab 的扫描码、扩展位和硬件/注入标志，不记录输入文字；日志位于 `%TEMP%\keyswap-keys.log`。
+参数：`--enable`、`--disable`、`--bridge`、`--no-bridge`、`--tray`、`--no-alttab`、`--quit`。排查问题时可用 `--logkeys`，只记录修饰键及 Tab/F12/Scroll Lock/Win 的键码、扫描码和硬件/注入标志，不记录输入文字；日志位于 `%TEMP%\keyswap-keys.log`。运行状态日志位于 `%USERPROFILE%\Applications\KeySwap\host.log`。
+
+使用小米 Pad 的 WorkBuddy + Moonlight + Sunshine 时，Pad 将 Alt+Tab 编码成 Alt+F12，将 Command 编码成 Scroll Lock。KeySwap 在同一个状态机中先解码，再应用互换策略：互换与保留均开启时得到 Alt+Tab；开启互换但关闭保留时得到 Ctrl+Tab；关闭互换时仍得到原生 Alt+Tab。本机 F12/Scroll Lock 和没有 Alt 的远程 F12保持原有行为。
+
+Pad 端 WorkBuddy 与 Moonlight 无需更新。方向键、三指拖动、触控板滚动仍由原来的 Pad 组件处理。内置状态服务兼容 UDP 57420 / `WB_STATUS_V2`，只返回版本及能力，不接受控制命令；端口占用会自动重试，不影响键盘。已有 Tailscale 状态防火墙规则不需要改动。
+
+迁移时先退出旧 `WorkBuddyAltTabHost.exe`，并关闭它的登录任务，只保留 KeySwap。程序检测到旧 Host 时会拒绝重复启用桥接；启用内置桥接后也会占用旧 Host 的单实例标记，防止误启动第二套钩子。仓库的 `scripts/migrate-workbuddy.ps1` 可执行带备份和失败回滚的本机迁移，必须在管理员 PowerShell 中指定候选程序路径；旧程序文件和日志会保留。
 
 若按键帽上的左 Alt 时，日志已经收到 Ctrl，说明输入端已先做过一次交换。可勾选“输入端已互换 Alt/Ctrl（仅本次开机校准）”，让普通互换和 Alt+Tab 保留基于实际物理位置工作。该校准绑定 Windows 本次启动时间，重启后自动失效；这是为了避免删除驱动映射后重启恢复正常，又被永久补偿反向。诊断日志的 `non-injected` 仅表示未标记为 SendInput 注入，不代表输入未经固件、驱动或虚拟键盘处理。
 
@@ -47,3 +53,7 @@
 随后用户按键帽顺序实测左 Alt、左 Ctrl，分别在钩子入口收到 `A2/1D`、`A4/38`。这直接定位了真实键盘路径上的双重交换：物理 Alt 先变成 Ctrl，程序又把 Ctrl 变回 Alt，于是 Alt+Tab 正常，但普通互换抵消。现在按本次开机校准处理这些设备事件；模拟输入绕过此补偿。补充后的状态测试为 23 项，另有 7 项服务测试和 6 项启动校准测试。
 
 启用本次开机校准后，用户已用本机真实键盘确认左 Alt+C 复制和左 Alt+Tab 窗口切换均正常。底层输入被交换的具体来源尚未确定，因此校准不跨 Windows 重启永久保存。
+
+远程输入还有独立冲突：KeySwap 先将 Sunshine 注入的 Alt 换成 Ctrl，使独立 WorkBuddy Host 注册的 Alt+F12 热键无法触发。1.1.0 将 Windows 桥接并入 KeySwap，统一处理来源按键、修饰键和释放责任，不再依赖两个进程的钩子顺序或异步热键转发。回归覆盖连续切换、快速松键、设置改变、未处理按键的重复、多来源持有、桥接关闭、独立 Win 键，以及部分发送失败。
+
+1.1.0 已通过 97 项自动测试和真实桌面集成测试，包括快速释放的 Pad Alt+F12、关闭互换后的桥接、右 Alt 与 Windows 键保持/释放。用户随后在小米 Pad → Moonlight → Sunshine 的实际会话中确认 Alt+C、Alt+Tab、按住 Alt 连按 Tab、Command+E 四项均正常。迁移后仅 KeySwap 运行并监听 UDP 57420，旧 WorkBuddy 登录任务已停用，原文件与迁移备份保留。

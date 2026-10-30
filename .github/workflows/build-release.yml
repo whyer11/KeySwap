@@ -48,12 +48,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "v1.0." + $env:GITHUB_RUN_NUMBER
+          $tag = "v" + (Get-Content VERSION -Raw).Trim()
           $sha = $env:GITHUB_SHA.Substring(0, 7)
 
           gh release view $tag --json tagName 2>$null | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "release $tag already exists, re-uploading with --clobber"
+            $releasedCommit = gh api "repos/$env:GITHUB_REPOSITORY/commits/$tag" --jq '.sha'
+            if ($LASTEXITCODE -ne 0) { throw "unable to resolve released tag $tag" }
+            if ($releasedCommit.Trim() -ne $env:GITHUB_SHA) {
+              Write-Host "$tag is already published from a different commit; bump VERSION for a new release."
+              exit 0
+            }
+            Write-Host "retrying asset upload for the same released commit $tag"
             gh release upload $tag "dist/KeySwap.exe#KeySwap.exe" --clobber
             gh release upload $tag "dist/KeySwap.zip#KeySwap.zip" --clobber
           } else {

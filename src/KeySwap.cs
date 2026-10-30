@@ -15,6 +15,12 @@ namespace KeySwap
         [STAThread]
         private static void Main()
         {
+            if (Array.Exists(Environment.GetCommandLineArgs(), delegate(string arg)
+                { return string.Equals(arg, "--quit", StringComparison.OrdinalIgnoreCase); }))
+            {
+                Native.PostMessage(new IntPtr(0xffff), Native.QuitMessage, IntPtr.Zero, IntPtr.Zero);
+                return;
+            }
             Native.EnablePerMonitorDpi();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -36,6 +42,7 @@ namespace KeySwap
     internal static class Native
     {
         public static readonly uint ShowMessage = RegisterWindowMessage("KeySwap.ShowMainWindow");
+        public static readonly uint QuitMessage = RegisterWindowMessage("KeySwap.Quit");
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern uint RegisterWindowMessage(string message);
         [DllImport("user32.dll")]
@@ -93,10 +100,12 @@ namespace KeySwap
         {
             public ushort scan;
             public bool up;
-            public ScanEvent(ushort scan, bool up)
+            public bool extended;
+            public ScanEvent(ushort scan, bool up, bool extended = false)
             {
                 this.scan = scan;
                 this.up = up;
+                this.extended = extended;
             }
         }
 
@@ -165,7 +174,8 @@ namespace KeySwap
                 inp.type = INPUT_KEYBOARD;
                 inp.ki.wVk = 0;
                 inp.ki.wScan = events[i].scan;
-                inp.ki.dwFlags = KEYEVENTF_SCANCODE | (events[i].up ? KEYEVENTF_KEYUP : 0);
+                inp.ki.dwFlags = KEYEVENTF_SCANCODE | (events[i].up ? KEYEVENTF_KEYUP : 0)
+                    | (events[i].extended ? 1U : 0U);
                 inp.ki.time = 0;
                 inp.ki.dwExtraInfo = MAGIC;
                 arr[i] = inp;
@@ -190,6 +200,7 @@ namespace KeySwap
         private readonly CheckBox chkRuntime;
         private readonly CheckBox chkKeepAltTab;
         private readonly CheckBox chkInputSwapped;
+        private readonly CheckBox chkBridge;
         private readonly Label lblSysState;
         private readonly Label lblWarn;
         private readonly Button btnWrite;
@@ -197,6 +208,11 @@ namespace KeySwap
 
         private KeyboardHook _keyboard;
         private bool _wantEnabled;
+        private bool _wantBridge;
+        private bool _reconfiguring;
+        private LegacyBridgeGuard _bridgeGuard;
+        private BridgeStatusServer _bridgeStatus;
+        private string _bridgeStatusError;
         private bool _settingsLoaded;
         private bool _autoStartEnabled;
         private bool _autoStartBusy;
@@ -205,12 +221,14 @@ namespace KeySwap
         private bool _logKeys;
         private string _logPath;
         private Timer _logTimer;
+        private Timer _statusTimer;
 
         private NotifyIcon _tray;
         private ContextMenuStrip _menu;
         private ToolStripMenuItem _miShow;
         private ToolStripMenuItem _miSwap;
         private ToolStripMenuItem _miKeepAltTab;
+        private ToolStripMenuItem _miBridge;
         private ToolStripMenuItem _miAutoStart;
         private bool _reallyExit;
         private bool _startHidden;
@@ -218,19 +236,19 @@ namespace KeySwap
 
         public MainForm()
         {
-            Text = "Alt / Ctrl 互换控制";
+            Text = "KeySwap — 键盘与小米 Pad 桥接";
             // 关掉自动缩放，改为在 OnLoad 里按实际 DPI 显式缩放整个窗体
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(470, 372);
+            ClientSize = new Size(470, 402);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9F);
 
             GroupBox gbRuntime = new GroupBox();
-            gbRuntime.Text = "运行时互换（立即生效，仅本程序运行期间）";
+            gbRuntime.Text = "键盘功能（立即生效，仅本程序运行期间）";
             gbRuntime.Location = new Point(14, 12);
-            gbRuntime.Size = new Size(442, 144);
+            gbRuntime.Size = new Size(442, 174);
             Controls.Add(gbRuntime);
 
             chkRuntime = new CheckBox();
@@ -254,24 +272,29 @@ namespace KeySwap
             chkInputSwapped.Checked = InputCalibration.IsSwapped();
             chkInputSwapped.CheckedChanged += delegate
             {
-                bool enabled = chkRuntime.Checked;
-                if (enabled) chkRuntime.Checked = false;
                 bool saved = InputCalibration.SetSwapped(chkInputSwapped.Checked);
-                if (enabled) chkRuntime.Checked = true;
+                if (_settingsLoaded) ReconfigureInput();
                 if (!saved) lblWarn.Text = "校准已用于当前程序，但保存失败；重新打开程序后需再次勾选。";
             };
             gbRuntime.Controls.Add(chkInputSwapped);
 
+            chkBridge = new CheckBox();
+            chkBridge.Text = "小米 Pad 键盘桥接（Alt+Tab / Command→Win）";
+            chkBridge.Location = new Point(16, 102);
+            chkBridge.Size = new Size(410, 24);
+            chkBridge.CheckedChanged += OnRuntimeToggled;
+            gbRuntime.Controls.Add(chkBridge);
+
             Label lblRtHint = new Label();
-            lblRtHint.Text = "右侧 Ctrl / Alt（AltGr）不受影响";
+            lblRtHint.Text = "右侧 Ctrl / Alt 不做互换";
             lblRtHint.ForeColor = Color.Gray;
-            lblRtHint.Location = new Point(36, 108);
+            lblRtHint.Location = new Point(36, 138);
             lblRtHint.Size = new Size(390, 20);
             gbRuntime.Controls.Add(lblRtHint);
 
             GroupBox gbSystem = new GroupBox();
             gbSystem.Text = "系统级映射（驱动层，重启后生效，游戏/登录界面也生效）";
-            gbSystem.Location = new Point(14, 166);
+            gbSystem.Location = new Point(14, 196);
             gbSystem.Size = new Size(442, 112);
             Controls.Add(gbSystem);
 
@@ -298,21 +321,23 @@ namespace KeySwap
             lblWarn = new Label();
             lblWarn.Text = "";
             lblWarn.ForeColor = Color.Firebrick;
-            lblWarn.Location = new Point(14, 286);
+            lblWarn.Location = new Point(14, 316);
             lblWarn.Size = new Size(442, 42);
             Controls.Add(lblWarn);
 
             Label lblFoot = new Label();
             lblFoot.Text = "提示：两种方式不要同时开启，否则会二次交换而恢复原状。";
             lblFoot.ForeColor = Color.DimGray;
-            lblFoot.Location = new Point(14, 338);
+            lblFoot.Location = new Point(14, 368);
             lblFoot.Size = new Size(442, 20);
             Controls.Add(lblFoot);
 
             RefreshSystemState();
             var options = StartupOptions.Parse(Environment.GetCommandLineArgs(),
-                UserPreferences.Get("Enabled", true), UserPreferences.Get("KeepAltTab", true));
+                UserPreferences.Get("Enabled", true), UserPreferences.Get("KeepAltTab", true),
+                UserPreferences.Get("BridgeEnabled", false));
             _wantEnabled = options.Enabled;
+            _wantBridge = options.BridgeEnabled;
             chkKeepAltTab.Checked = options.KeepAltTab;
             _startHidden = options.Tray;
             if (_startHidden) { ShowInTaskbar = false; WindowState = FormWindowState.Minimized; }
@@ -327,6 +352,10 @@ namespace KeySwap
                 _keyLog.Enqueue("=== KeySwap modifier diagnostics " + DateTime.Now + " calibrated=" + chkInputSwapped.Checked + " ===");
             }
             BuildTray();
+            _statusTimer = new Timer();
+            _statusTimer.Interval = 5000;
+            _statusTimer.Tick += delegate { if (chkBridge.Checked && _keyboard != null && _keyboard.IsRunning) StartBridgeStatus(); };
+            _statusTimer.Start();
         }
 
         private static bool IsSystemMapSet()
@@ -359,6 +388,11 @@ namespace KeySwap
 
         private void UpdateWarning()
         {
+            if (!string.IsNullOrEmpty(_bridgeStatusError))
+            {
+                lblWarn.Text = "键盘桥接正常；平板状态服务暂不可用，将自动重试。";
+                return;
+            }
             if (chkRuntime.Checked && IsSystemMapSet())
             {
                 lblWarn.Text = "警告：系统级映射和运行时互换同时开启，会交换两次等于没交换。请关闭其中一种。";
@@ -371,31 +405,122 @@ namespace KeySwap
 
         private void OnRuntimeToggled(object sender, EventArgs e)
         {
-            if (chkRuntime.Checked)
+            if (_settingsLoaded && !_reconfiguring) ReconfigureInput();
+        }
+
+        private void ReconfigureInput()
+        {
+            if (_reconfiguring) return;
+            _reconfiguring = true;
+            string warning = null;
+            try
             {
-                _keyboard = new KeyboardHook();
-                _keyboard.KeepAltTab = chkKeepAltTab.Checked;
-                _keyboard.InputSwapped = chkInputSwapped.Checked;
-                if (_logKeys) _keyboard.KeyObserved += LogKey;
-                _keyboard.Error += delegate(string error)
+                StopBridgeStatus();
+                if (_keyboard != null) { _keyboard.Dispose(); _keyboard = null; }
+                if (!chkBridge.Checked && _bridgeGuard != null)
                 {
-                    PostToUi(delegate { chkRuntime.Checked = false; lblWarn.Text = error; });
-                };
-                if (!_keyboard.Start())
+                    _bridgeGuard.Dispose(); _bridgeGuard = null;
+                }
+                if (chkBridge.Checked && _bridgeGuard == null)
                 {
-                    chkRuntime.Checked = false;
-                    lblWarn.Text = "键盘钩子安装失败，请重新启用。";
-                    return;
+                    var guard = new LegacyBridgeGuard();
+                    if (guard.TryAcquire()) _bridgeGuard = guard;
+                    else
+                    {
+                        warning = "旧 WorkBuddy Host 正在运行，请退出后再启用 Pad 桥接。";
+                        LogHost("BRIDGE_CONFLICT " + guard.LastError);
+                        guard.Dispose();
+                        chkBridge.Checked = false;
+                    }
+                }
+                if (chkRuntime.Checked || chkBridge.Checked)
+                {
+                    var keyboard = new KeyboardHook();
+                    keyboard.KeepAltTab = chkKeepAltTab.Checked;
+                    keyboard.SwapEnabled = chkRuntime.Checked;
+                    keyboard.BridgeEnabled = chkBridge.Checked;
+                    keyboard.InputSwapped = chkInputSwapped.Checked;
+                    if (_logKeys) keyboard.KeyObserved += LogKey;
+                    keyboard.Error += delegate(string error)
+                    {
+                        PostToUi(delegate
+                        {
+                            if (_keyboard != keyboard) return;
+                            _reconfiguring = true;
+                            chkRuntime.Checked = chkBridge.Checked = false;
+                            _reconfiguring = false;
+                            ReconfigureInput();
+                            lblWarn.Text = error;
+                            LogHost("KEYBOARD_FAILED " + error);
+                        });
+                    };
+                    _keyboard = keyboard;
+                    if (!keyboard.Start())
+                    {
+                        keyboard.Dispose(); _keyboard = null;
+                        chkRuntime.Checked = chkBridge.Checked = false;
+                        if (_bridgeGuard != null) { _bridgeGuard.Dispose(); _bridgeGuard = null; }
+                        warning = "键盘钩子安装失败，请重新启用。";
+                    }
+                    else if (chkBridge.Checked) StartBridgeStatus();
                 }
             }
-            else if (_keyboard != null)
+            finally { _reconfiguring = false; }
+            if (_settingsLoaded)
             {
-                _keyboard.Dispose();
-                _keyboard = null;
+                UserPreferences.Set("Enabled", chkRuntime.Checked);
+                UserPreferences.Set("BridgeEnabled", chkBridge.Checked);
             }
-            if (_settingsLoaded) UserPreferences.Set("Enabled", chkRuntime.Checked);
             UpdateWarning();
+            if (warning != null) lblWarn.Text = warning;
             RefreshMenuItemStates();
+            LogHost("HOST_STATE swap=" + chkRuntime.Checked + " bridge=" + chkBridge.Checked
+                + " keyboard=" + (_keyboard != null && _keyboard.IsRunning));
+        }
+
+        private void StartBridgeStatus()
+        {
+            if (_keyboard == null || !_keyboard.IsRunning) return;
+            if (_bridgeStatus == null)
+            {
+                KeyboardHook keyboard = _keyboard;
+                _bridgeStatus = new BridgeStatusServer(isReady: delegate { return keyboard.IsRunning && keyboard.BridgeEnabled; });
+            }
+            if (_bridgeStatus.IsRunning) return;
+            if (_bridgeStatus.Start())
+            {
+                _bridgeStatusError = null;
+                LogHost("STATUS_READY port=57420 protocol=2");
+            }
+            else
+            {
+                string error = _bridgeStatus.LastError;
+                if (_bridgeStatusError != error) LogHost("STATUS_DEGRADED " + error);
+                _bridgeStatusError = error;
+            }
+            UpdateWarning();
+        }
+
+        private void StopBridgeStatus()
+        {
+            if (_bridgeStatus != null) { _bridgeStatus.Dispose(); _bridgeStatus = null; }
+            _bridgeStatusError = null;
+        }
+
+        private static string HostLogDirectory
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Applications", "KeySwap"); }
+        }
+
+        private static void LogHost(string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(HostLogDirectory);
+                File.AppendAllText(Path.Combine(HostLogDirectory, "host.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + message + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
         }
 
         private void PostToUi(Action action)
@@ -407,7 +532,9 @@ namespace KeySwap
         private void LogKey(Native.KBDLLHOOKSTRUCT info, bool isUp)
         {
             // Diagnostics deliberately exclude letters and other typed content.
-            if (info.scanCode != 0x38 && info.scanCode != 0x1D && info.scanCode != 15) return;
+            if (info.scanCode != 0x38 && info.scanCode != 0x1D && info.scanCode != 15
+                && info.vkCode != 9 && info.vkCode != 0x7B && info.vkCode != 0x91
+                && info.vkCode != 0x5B) return;
             _keyLog.Enqueue(string.Format("{0:HH:mm:ss.fff} vk=0x{1:X2} scan=0x{2:X2} flags=0x{3:X2} {4} {5}",
                 DateTime.Now, info.vkCode, info.scanCode, info.flags, isUp ? "UP" : "DOWN",
                 (info.flags & 0x10) != 0 ? "injected" : "non-injected"));
@@ -472,7 +599,11 @@ namespace KeySwap
                 return;
             }
 
+            if (_statusTimer != null) { _statusTimer.Stop(); _statusTimer.Dispose(); }
+            StopBridgeStatus();
             if (_keyboard != null) { _keyboard.Dispose(); _keyboard = null; }
+            if (_bridgeGuard != null) { _bridgeGuard.Dispose(); _bridgeGuard = null; }
+            LogHost("HOST_STOPPED");
             if (_logTimer != null) { _logTimer.Stop(); _logTimer.Dispose(); FlushKeyLog(null, EventArgs.Empty); }
             if (_tray != null)
             {
@@ -517,11 +648,18 @@ namespace KeySwap
             _miKeepAltTab.Click += delegate { chkKeepAltTab.Checked = !chkKeepAltTab.Checked; };
             _menu.Items.Add(_miKeepAltTab);
 
+            _miBridge = new ToolStripMenuItem("小米 Pad 键盘桥接");
+            _miBridge.Click += delegate { chkBridge.Checked = !chkBridge.Checked; };
+            _menu.Items.Add(_miBridge);
+
             _menu.Items.Add(new ToolStripSeparator());
 
             _miAutoStart = new ToolStripMenuItem("开机自动启动");
             _miAutoStart.Click += delegate { OnToggleAutoStart(); };
             _menu.Items.Add(_miAutoStart);
+            var openLog = new ToolStripMenuItem("打开日志目录");
+            openLog.Click += delegate { Directory.CreateDirectory(HostLogDirectory); Process.Start("explorer.exe", HostLogDirectory); };
+            _menu.Items.Add(openLog);
             _menu.Items.Add(new ToolStripSeparator());
             ToolStripMenuItem miExit = new ToolStripMenuItem("退出");
             miExit.Click += delegate { _reallyExit = true; Close(); };
@@ -548,6 +686,7 @@ namespace KeySwap
         protected override void WndProc(ref Message message)
         {
             if ((uint)message.Msg == Native.ShowMessage) ShowMainWindow();
+            if ((uint)message.Msg == Native.QuitMessage) { _reallyExit = true; Close(); return; }
             base.WndProc(ref message);
         }
 
@@ -579,9 +718,12 @@ namespace KeySwap
             _miSwap.Checked = chkRuntime.Checked;
             _miKeepAltTab.Checked = chkKeepAltTab.Checked;
             _miKeepAltTab.Enabled = chkRuntime.Checked;
+            _miBridge.Checked = chkBridge.Checked;
             _miAutoStart.Checked = _autoStartEnabled;
             _miAutoStart.Enabled = !_autoStartBusy;
-            if (_tray != null) _tray.Text = chkRuntime.Checked ? "KeySwap — 互换已启用" : "KeySwap — 互换已暂停";
+            if (_tray != null) _tray.Text = "KeySwap — " + (chkRuntime.Checked
+                ? (chkBridge.Checked ? "互换 + Pad 桥接" : "互换已启用")
+                : (chkBridge.Checked ? "Pad 桥接已启用" : "键盘功能已暂停"));
         }
 
         private void RefreshAutoStart(bool ensure)
@@ -656,7 +798,11 @@ namespace KeySwap
         {
             base.OnShown(e);
             _settingsLoaded = true;
+            _reconfiguring = true;
             chkRuntime.Checked = _wantEnabled;
+            chkBridge.Checked = _wantBridge;
+            _reconfiguring = false;
+            ReconfigureInput();
             if (_startHidden) Hide();
             RefreshAutoStart(true);
         }
