@@ -13,7 +13,7 @@ if (-not (Test-Path $csc)) {
 
 New-Item -ItemType Directory -Force -Path (Split-Path $out -Parent) | Out-Null
 
-& $csc /nologo /target:winexe /platform:x64 /optimize+ `
+& $csc /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 `
     "/out:$out" `
     "/win32manifest:$(Join-Path $root 'src\app.manifest')" `
     /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
