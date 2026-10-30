@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <rect x="0" y="0" width="256" height="256" rx="58" ry="58" fill="#4F46E5"/>
+  <!-- 上箭头：向右 -->
+  <g stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" fill="none">
+    <path d="M64 100 H 172"/>
+    <path d="M194 156 H 86"/>
+  </g>
+  <polygon points="176,74 212,100 176,126" fill="#FFFFFF"/>
+  <polygon points="82,130 46,156 82,182" fill="#FFFFFF"/>
+</svg>

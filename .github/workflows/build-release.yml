@@ -26,6 +26,10 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
+      - name: Regression tests
+        shell: pwsh
+        run: ./test.ps1
+
       - name: Package
         shell: pwsh
         run: Compress-Archive -Path dist/KeySwap.exe -DestinationPath dist/KeySwap.zip -Force

@@ -1,7 +1,8 @@
+﻿param([string]$OutputPath)
 $ErrorActionPreference = 'Stop'
 
 $root = $PSScriptRoot
-$out  = Join-Path $root 'dist\KeySwap.exe'
+$out = if ($OutputPath) { [IO.Path]::GetFullPath($OutputPath) } else { Join-Path $root 'dist\KeySwap.exe' }
 
 $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $csc)) {
@@ -16,8 +17,10 @@ New-Item -ItemType Directory -Force -Path (Split-Path $out -Parent) | Out-Null
 & $csc /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 `
     "/out:$out" `
     "/win32manifest:$(Join-Path $root 'src\app.manifest')" `
-    /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll `
-    (Join-Path $root 'src\KeySwap.cs')
+    "/win32icon:$(Join-Path $root 'assets\KeySwap.ico')" `
+    "/resource:$(Join-Path $root 'assets\KeySwap.ico'),KeySwap.ico" `
+    /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Xml.dll /r:System.Management.dll `
+    (Get-ChildItem (Join-Path $root 'src') -Filter '*.cs' | ForEach-Object FullName)
 
 if ($LASTEXITCODE -ne 0) { throw "编译失败，csc 退出码 $LASTEXITCODE" }
 

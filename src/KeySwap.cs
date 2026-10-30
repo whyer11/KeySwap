@@ -1,7 +1,10 @@
-using System;
+﻿using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -15,12 +18,28 @@ namespace KeySwap
             Native.EnablePerMonitorDpi();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            bool created;
+            string name = @"Local\KeySwap-" + System.Security.Principal.WindowsIdentity.GetCurrent().User.Value;
+            using (var instance = new System.Threading.Mutex(true, name, out created))
+            {
+                if (!created)
+                {
+                    Native.PostMessage(new IntPtr(0xffff), Native.ShowMessage, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+                try { Application.Run(new MainForm()); }
+                finally { instance.ReleaseMutex(); }
+            }
         }
     }
 
     internal static class Native
     {
+        public static readonly uint ShowMessage = RegisterWindowMessage("KeySwap.ShowMainWindow");
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint RegisterWindowMessage(string message);
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
         public const int WH_KEYBOARD_LL = 13;
         public const int WM_KEYDOWN = 0x0100;
         public const int WM_KEYUP = 0x0101;
@@ -30,6 +49,8 @@ namespace KeySwap
         public const uint VK_LMENU = 0xA4;
         public const uint VK_LCONTROL = 0xA2;
         public const ushort SC_TAB = 0x0F;
+        // 注意：扩展位是 0x01；0x20 是 LLKHF_ALTDOWN，别混用
+        public const uint LLKHF_EXTENDED = 0x01;
         public const ushort SC_LEFTCTRL = 0x1D;
         public const ushort SC_LEFTALT = 0x38;
         public const uint INPUT_KEYBOARD = 1;
@@ -133,9 +154,9 @@ namespace KeySwap
         }
 
         // 一次 SendInput 提交，保证系统按数组顺序处理
-        public static void SendBatch(ScanEvent[] events)
+        public static bool SendBatch(ScanEvent[] events)
         {
-            if (events == null || events.Length == 0) return;
+            if (events == null || events.Length == 0) return true;
 
             INPUT[] arr = new INPUT[events.Length];
             for (int i = 0; i < events.Length; i++)
@@ -149,7 +170,7 @@ namespace KeySwap
                 inp.ki.dwExtraInfo = MAGIC;
                 arr[i] = inp;
             }
-            SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));
+            return SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT))) == arr.Length;
         }
     }
 
@@ -168,23 +189,39 @@ namespace KeySwap
 
         private readonly CheckBox chkRuntime;
         private readonly CheckBox chkKeepAltTab;
+        private readonly CheckBox chkInputSwapped;
         private readonly Label lblSysState;
         private readonly Label lblWarn;
         private readonly Button btnWrite;
         private readonly Button btnRemove;
 
-        private IntPtr _hookId = IntPtr.Zero;
-        private Native.LowLevelKeyboardProc _proc;
+        private KeyboardHook _keyboard;
+        private bool _wantEnabled;
+        private bool _settingsLoaded;
+        private bool _autoStartEnabled;
+        private bool _autoStartBusy;
 
-        private bool _physAltDown;
-        private bool _altTabEngaged;
+        private readonly ConcurrentQueue<string> _keyLog = new ConcurrentQueue<string>();
+        private bool _logKeys;
+        private string _logPath;
+        private Timer _logTimer;
+
+        private NotifyIcon _tray;
+        private ContextMenuStrip _menu;
+        private ToolStripMenuItem _miShow;
+        private ToolStripMenuItem _miSwap;
+        private ToolStripMenuItem _miKeepAltTab;
+        private ToolStripMenuItem _miAutoStart;
+        private bool _reallyExit;
+        private bool _startHidden;
+        private bool _hideTipShown;
 
         public MainForm()
         {
             Text = "Alt / Ctrl 互换控制";
             // 关掉自动缩放，改为在 OnLoad 里按实际 DPI 显式缩放整个窗体
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(470, 348);
+            ClientSize = new Size(470, 372);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
@@ -193,7 +230,7 @@ namespace KeySwap
             GroupBox gbRuntime = new GroupBox();
             gbRuntime.Text = "运行时互换（立即生效，仅本程序运行期间）";
             gbRuntime.Location = new Point(14, 12);
-            gbRuntime.Size = new Size(442, 120);
+            gbRuntime.Size = new Size(442, 144);
             Controls.Add(gbRuntime);
 
             chkRuntime = new CheckBox();
@@ -210,16 +247,31 @@ namespace KeySwap
             chkKeepAltTab.Checked = true;
             gbRuntime.Controls.Add(chkKeepAltTab);
 
+            chkInputSwapped = new CheckBox();
+            chkInputSwapped.Text = "输入端已互换 Alt/Ctrl（仅本次开机校准）";
+            chkInputSwapped.Location = new Point(36, 76);
+            chkInputSwapped.Size = new Size(390, 24);
+            chkInputSwapped.Checked = InputCalibration.IsSwapped();
+            chkInputSwapped.CheckedChanged += delegate
+            {
+                bool enabled = chkRuntime.Checked;
+                if (enabled) chkRuntime.Checked = false;
+                bool saved = InputCalibration.SetSwapped(chkInputSwapped.Checked);
+                if (enabled) chkRuntime.Checked = true;
+                if (!saved) lblWarn.Text = "校准已用于当前程序，但保存失败；重新打开程序后需再次勾选。";
+            };
+            gbRuntime.Controls.Add(chkInputSwapped);
+
             Label lblRtHint = new Label();
             lblRtHint.Text = "右侧 Ctrl / Alt（AltGr）不受影响";
             lblRtHint.ForeColor = Color.Gray;
-            lblRtHint.Location = new Point(36, 82);
+            lblRtHint.Location = new Point(36, 108);
             lblRtHint.Size = new Size(390, 20);
             gbRuntime.Controls.Add(lblRtHint);
 
             GroupBox gbSystem = new GroupBox();
             gbSystem.Text = "系统级映射（驱动层，重启后生效，游戏/登录界面也生效）";
-            gbSystem.Location = new Point(14, 142);
+            gbSystem.Location = new Point(14, 166);
             gbSystem.Size = new Size(442, 112);
             Controls.Add(gbSystem);
 
@@ -246,34 +298,35 @@ namespace KeySwap
             lblWarn = new Label();
             lblWarn.Text = "";
             lblWarn.ForeColor = Color.Firebrick;
-            lblWarn.Location = new Point(14, 262);
+            lblWarn.Location = new Point(14, 286);
             lblWarn.Size = new Size(442, 42);
             Controls.Add(lblWarn);
 
             Label lblFoot = new Label();
             lblFoot.Text = "提示：两种方式不要同时开启，否则会二次交换而恢复原状。";
             lblFoot.ForeColor = Color.DimGray;
-            lblFoot.Location = new Point(14, 314);
+            lblFoot.Location = new Point(14, 338);
             lblFoot.Size = new Size(442, 20);
             Controls.Add(lblFoot);
 
-            _proc = HookProc;
             RefreshSystemState();
-
-            // 命令行 --enable：启动即启用运行时互换
-            string[] argv = Environment.GetCommandLineArgs();
-            for (int i = 1; i < argv.Length; i++)
+            var options = StartupOptions.Parse(Environment.GetCommandLineArgs(),
+                UserPreferences.Get("Enabled", true), UserPreferences.Get("KeepAltTab", true));
+            _wantEnabled = options.Enabled;
+            chkKeepAltTab.Checked = options.KeepAltTab;
+            _startHidden = options.Tray;
+            if (_startHidden) { ShowInTaskbar = false; WindowState = FormWindowState.Minimized; }
+            _logKeys = options.LogKeys;
+            if (_logKeys)
             {
-                if (string.Equals(argv[i], "--enable", StringComparison.OrdinalIgnoreCase))
-                {
-                    chkRuntime.Checked = true;
-                    break;
-                }
-                if (string.Equals(argv[i], "--no-alttab", StringComparison.OrdinalIgnoreCase))
-                {
-                    chkKeepAltTab.Checked = false;
-                }
+                _logPath = Path.Combine(Path.GetTempPath(), "keyswap-keys.log");
+                _logTimer = new Timer();
+                _logTimer.Interval = 500;
+                _logTimer.Tick += FlushKeyLog;
+                _logTimer.Start();
+                _keyLog.Enqueue("=== KeySwap modifier diagnostics " + DateTime.Now + " calibrated=" + chkInputSwapped.Checked + " ===");
             }
+            BuildTray();
         }
 
         private static bool IsSystemMapSet()
@@ -320,105 +373,54 @@ namespace KeySwap
         {
             if (chkRuntime.Checked)
             {
-                if (!InstallHook())
+                _keyboard = new KeyboardHook();
+                _keyboard.KeepAltTab = chkKeepAltTab.Checked;
+                _keyboard.InputSwapped = chkInputSwapped.Checked;
+                if (_logKeys) _keyboard.KeyObserved += LogKey;
+                _keyboard.Error += delegate(string error)
+                {
+                    PostToUi(delegate { chkRuntime.Checked = false; lblWarn.Text = error; });
+                };
+                if (!_keyboard.Start())
                 {
                     chkRuntime.Checked = false;
-                    MessageBox.Show(this, "键盘钩子安装失败，无法启用运行时互换。", "错误",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    lblWarn.Text = "键盘钩子安装失败，请重新启用。";
+                    return;
                 }
             }
-            else
+            else if (_keyboard != null)
             {
-                UninstallHook();
+                _keyboard.Dispose();
+                _keyboard = null;
             }
+            if (_settingsLoaded) UserPreferences.Set("Enabled", chkRuntime.Checked);
             UpdateWarning();
+            RefreshMenuItemStates();
         }
 
-        private bool InstallHook()
+        private void PostToUi(Action action)
         {
-            if (_hookId != IntPtr.Zero) return true;
-            ResetComboState();
-            using (Process cur = Process.GetCurrentProcess())
-            using (ProcessModule mod = cur.MainModule)
-            {
-                _hookId = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _proc,
-                    Native.GetModuleHandle(mod.ModuleName), 0);
-            }
-            return _hookId != IntPtr.Zero;
+            if (!IsHandleCreated || IsDisposed) return;
+            try { BeginInvoke(action); } catch (InvalidOperationException) { }
         }
 
-        private void UninstallHook()
+        private void LogKey(Native.KBDLLHOOKSTRUCT info, bool isUp)
         {
-            if (_hookId == IntPtr.Zero) return;
-            Native.UnhookWindowsHookEx(_hookId);
-            _hookId = IntPtr.Zero;
-            ResetComboState();
+            // Diagnostics deliberately exclude letters and other typed content.
+            if (info.scanCode != 0x38 && info.scanCode != 0x1D && info.scanCode != 15) return;
+            _keyLog.Enqueue(string.Format("{0:HH:mm:ss.fff} vk=0x{1:X2} scan=0x{2:X2} flags=0x{3:X2} {4} {5}",
+                DateTime.Now, info.vkCode, info.scanCode, info.flags, isUp ? "UP" : "DOWN",
+                (info.flags & 0x10) != 0 ? "injected" : "non-injected"));
         }
 
-        private void ResetComboState()
+        private void FlushKeyLog(object sender, EventArgs e)
         {
-            _physAltDown = false;
-            _altTabEngaged = false;
-        }
-
-        private IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0 && _hookId != IntPtr.Zero)
-            {
-                Native.KBDLLHOOKSTRUCT info = (Native.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(
-                    lParam, typeof(Native.KBDLLHOOKSTRUCT));
-
-                if (info.dwExtraInfo != Native.MAGIC)
-                {
-                    int msg = wParam.ToInt32();
-                    bool isUp = (msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP);
-
-                    if (info.vkCode == Native.VK_LMENU)
-                    {
-                        if (isUp)
-                        {
-                            _physAltDown = false;
-                            if (_altTabEngaged)
-                            {
-                                // 系统侧的 Alt 还按着，松开即提交窗口切换
-                                Native.SendScan(Native.SC_LEFTALT, true);
-                                _altTabEngaged = false;
-                            }
-                            else
-                            {
-                                Native.SendScan(Native.SC_LEFTCTRL, true);
-                            }
-                        }
-                        else
-                        {
-                            _physAltDown = true;
-                            Native.SendScan(Native.SC_LEFTCTRL, false);
-                        }
-                        return (IntPtr)1;
-                    }
-
-                    if (info.vkCode == Native.VK_LCONTROL)
-                    {
-                        Native.SendScan(Native.SC_LEFTALT, isUp);
-                        return (IntPtr)1;
-                    }
-
-                    // 物理 Alt 按住期间按下 Tab：把系统状态切回原生 Alt，再补发 Tab
-                    if (info.vkCode == Native.VK_TAB && chkKeepAltTab.Checked
-                        && !isUp && _physAltDown && !_altTabEngaged)
-                    {
-                        _altTabEngaged = true;
-                        Native.SendBatch(new Native.ScanEvent[]
-                        {
-                            new Native.ScanEvent(Native.SC_LEFTCTRL, true),
-                            new Native.ScanEvent(Native.SC_LEFTALT, false),
-                            new Native.ScanEvent(Native.SC_TAB, false)
-                        });
-                        return (IntPtr)1;
-                    }
-                }
-            }
-            return Native.CallNextHookEx(_hookId, nCode, wParam, lParam);
+            if (_keyLog.Count == 0) return;
+            StringBuilder sb = new StringBuilder();
+            string line;
+            while (_keyLog.TryDequeue(out line)) sb.AppendLine(line);
+            try { File.AppendAllText(_logPath, sb.ToString(), Encoding.UTF8); }
+            catch { }
         }
 
         private void OnWrite(object sender, EventArgs e)
@@ -463,8 +465,168 @@ namespace KeySwap
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            UninstallHook();
+            if (!_reallyExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+
+            if (_keyboard != null) { _keyboard.Dispose(); _keyboard = null; }
+            if (_logTimer != null) { _logTimer.Stop(); _logTimer.Dispose(); FlushKeyLog(null, EventArgs.Empty); }
+            if (_tray != null)
+            {
+                _tray.Visible = false;
+                _tray.Dispose();
+                _tray = null;
+            }
             base.OnFormClosing(e);
+        }
+
+        private void BuildTray()
+        {
+            Icon appIcon = null;
+            try
+            {
+                using (Stream s = typeof(MainForm).Assembly.GetManifestResourceStream("KeySwap.ico"))
+                {
+                    if (s != null) appIcon = new Icon(s);
+                }
+            }
+            catch { }
+            if (appIcon == null)
+            {
+                try { appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+                catch { }
+            }
+            if (appIcon != null) Icon = appIcon;
+
+            _menu = new ContextMenuStrip();
+            _menu.Font = new Font("Microsoft YaHei UI", 9F);
+
+            _miShow = new ToolStripMenuItem("显示主窗口");
+            _miShow.Click += delegate { ShowMainWindow(); };
+            _menu.Items.Add(_miShow);
+            _menu.Items.Add(new ToolStripSeparator());
+
+            _miSwap = new ToolStripMenuItem("交换左侧 Alt / Ctrl");
+            _miSwap.Click += delegate { chkRuntime.Checked = !chkRuntime.Checked; };
+            _menu.Items.Add(_miSwap);
+
+            _miKeepAltTab = new ToolStripMenuItem("物理 Alt + Tab 保持原生");
+            _miKeepAltTab.Click += delegate { chkKeepAltTab.Checked = !chkKeepAltTab.Checked; };
+            _menu.Items.Add(_miKeepAltTab);
+
+            _menu.Items.Add(new ToolStripSeparator());
+
+            _miAutoStart = new ToolStripMenuItem("开机自动启动");
+            _miAutoStart.Click += delegate { OnToggleAutoStart(); };
+            _menu.Items.Add(_miAutoStart);
+            _menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem miExit = new ToolStripMenuItem("退出");
+            miExit.Click += delegate { _reallyExit = true; Close(); };
+            _menu.Items.Add(miExit);
+
+            _menu.Opening += delegate { RefreshMenuItemStates(); RefreshAutoStart(false); };
+
+            _tray = new NotifyIcon();
+            if (appIcon != null) _tray.Icon = appIcon;
+            _tray.Text = "KeySwap — Alt / Ctrl 互换";
+            _tray.ContextMenuStrip = _menu;
+            _tray.Visible = true;
+            _tray.DoubleClick += delegate { ShowMainWindow(); };
+
+            chkKeepAltTab.CheckedChanged += delegate
+            {
+                if (_keyboard != null) _keyboard.KeepAltTab = chkKeepAltTab.Checked;
+                if (_settingsLoaded) UserPreferences.Set("KeepAltTab", chkKeepAltTab.Checked);
+                RefreshMenuItemStates();
+            };
+            RefreshMenuItemStates();
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if ((uint)message.Msg == Native.ShowMessage) ShowMainWindow();
+            base.WndProc(ref message);
+        }
+
+        private void ShowMainWindow()
+        {
+            ShowInTaskbar = true;
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+            BringToFront();
+        }
+
+        private void HideToTray()
+        {
+            ShowInTaskbar = false;
+            Hide();
+            if (!_hideTipShown && _tray != null)
+            {
+                _hideTipShown = true;
+                _tray.BalloonTipTitle = "KeySwap 仍在运行";
+                _tray.BalloonTipText = "程序已最小化到托盘，右键图标可以开关互换或退出。";
+                _tray.ShowBalloonTip(4000);
+            }
+        }
+
+        private void RefreshMenuItemStates()
+        {
+            if (_miSwap == null) return;
+            _miSwap.Checked = chkRuntime.Checked;
+            _miKeepAltTab.Checked = chkKeepAltTab.Checked;
+            _miKeepAltTab.Enabled = chkRuntime.Checked;
+            _miAutoStart.Checked = _autoStartEnabled;
+            _miAutoStart.Enabled = !_autoStartBusy;
+            if (_tray != null) _tray.Text = chkRuntime.Checked ? "KeySwap — 互换已启用" : "KeySwap — 互换已暂停";
+        }
+
+        private void RefreshAutoStart(bool ensure)
+        {
+            if (_autoStartBusy) return;
+            _autoStartBusy = true;
+            RefreshMenuItemStates();
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool enabled = AutoStartManager.IsEnabled();
+                string error = null;
+                if (ensure && UserPreferences.Get("AutoStart", true) && !AutoStartManager.IsConfigured())
+                {
+                    if (AutoStartManager.SetEnabled(true)) { enabled = true; UserPreferences.Set("AutoStart", true); }
+                    else error = AutoStartManager.LastError;
+                }
+                PostToUi(delegate
+                {
+                    _autoStartEnabled = enabled;
+                    _autoStartBusy = false;
+                    if (error != null) lblWarn.Text = "开机启动设置失败：" + error;
+                    RefreshMenuItemStates();
+                });
+            });
+        }
+
+        private void OnToggleAutoStart()
+        {
+            if (_autoStartBusy) return;
+            bool wanted = !_autoStartEnabled;
+            _autoStartBusy = true;
+            RefreshMenuItemStates();
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool success = AutoStartManager.SetEnabled(wanted);
+                string error = AutoStartManager.LastError;
+                if (success) UserPreferences.Set("AutoStart", wanted);
+                PostToUi(delegate
+                {
+                    _autoStartBusy = false;
+                    if (success) _autoStartEnabled = wanted;
+                    else lblWarn.Text = "开机启动设置失败：" + error;
+                    RefreshMenuItemStates();
+                });
+            });
         }
 
         private float _appliedScale = 1f;
@@ -488,6 +650,15 @@ namespace KeySwap
         {
             base.OnLoad(e);
             ApplyCurrentDpi();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            _settingsLoaded = true;
+            chkRuntime.Checked = _wantEnabled;
+            if (_startHidden) Hide();
+            RefreshAutoStart(true);
         }
 
         protected override void OnDpiChanged(DpiChangedEventArgs e)
