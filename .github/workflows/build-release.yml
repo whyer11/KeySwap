@@ -26,11 +26,17 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/KeySwap.exe -DestinationPath dist/KeySwap.zip -Force
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: KeySwap-exe
-          path: dist/KeySwap.exe
+          path: |
+            dist/KeySwap.exe
+            dist/KeySwap.zip
           if-no-files-found: error
 
       - name: Publish release
@@ -45,8 +51,11 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "release $tag already exists, re-uploading with --clobber"
             gh release upload $tag "dist/KeySwap.exe#KeySwap.exe" --clobber
+            gh release upload $tag "dist/KeySwap.zip#KeySwap.zip" --clobber
           } else {
-            gh release create $tag "dist/KeySwap.exe#KeySwap.exe" `
+            gh release create $tag `
+              "dist/KeySwap.exe#KeySwap.exe" `
+              "dist/KeySwap.zip#KeySwap.zip" `
               --title "KeySwap $tag ($sha)" `
               --target $env:GITHUB_SHA `
               --generate-notes

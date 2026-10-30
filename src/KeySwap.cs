@@ -12,6 +12,7 @@ namespace KeySwap
         [STAThread]
         private static void Main()
         {
+            Native.EnablePerMonitorDpi();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -95,6 +96,36 @@ namespace KeySwap
 
         [DllImport("user32.dll")]
         public static extern uint GetDpiForWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+
+        [DllImport("shcore.dll")]
+        private static extern int SetProcessDpiAwareness(int value);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        // 必须在创建任何窗口之前声明，否则 Windows 会按 96 DPI 渲染再位图放大
+        public static void EnablePerMonitorDpi()
+        {
+            try
+            {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return;
+            }
+            catch (EntryPointNotFoundException) { }
+
+            try
+            {
+                if (SetProcessDpiAwareness(2) == 0) return; // PROCESS_PER_MONITOR_DPI_AWARE
+            }
+            catch (EntryPointNotFoundException) { }
+            catch (DllNotFoundException) { }
+
+            try { SetProcessDPIAware(); }
+            catch (EntryPointNotFoundException) { }
+        }
 
         public static void SendScan(ushort scan, bool up)
         {

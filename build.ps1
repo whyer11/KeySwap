@@ -24,8 +24,4 @@ if ($LASTEXITCODE -ne 0) { throw "编译失败，csc 退出码 $LASTEXITCODE" }
 $f = Get-Item $out
 "已生成: $($f.FullName)  ($([math]::Round($f.Length/1KB,1)) KB)"
 
-# WinForms 的 PerMonitorV2 需要运行时配置，必须放在 exe 旁边
-$cfgSrc = Join-Path $root 'src\app.config'
-$cfgOut = "$out.config"
-Copy-Item $cfgSrc $cfgOut -Force
-"已生成: $cfgOut"
+# DPI 感知已在代码里调用 SetProcessDpiAwarenessContext 声明，无需 .config，单文件即可运行
