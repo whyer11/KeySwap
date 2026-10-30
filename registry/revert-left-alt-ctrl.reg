@@ -1,0 +1,7 @@
+Windows Registry Editor Version 5.00
+
+; 回滚：删除 Scancode Map，恢复 Alt / Ctrl 原始行为
+; 删除后同样需要重启才生效
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout]
+"Scancode Map"=-

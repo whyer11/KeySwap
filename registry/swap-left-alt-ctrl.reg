@@ -1,0 +1,10 @@
+Windows Registry Editor Version 5.00
+
+; 只交换左侧 Alt 和左侧 Ctrl
+; 物理 Left Alt (0x38) -> 产生 Left Ctrl (0x1D)
+; 物理 Left Ctrl (0x1D) -> 产生 Left Alt (0x38)
+; 右侧 Alt / Ctrl (E0 前缀) 不受影响
+; 生效需要重启；回滚请运行 revert-left-alt-ctrl.reg
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout]
+"Scancode Map"=hex:00,00,00,00,00,00,00,00,03,00,00,00,1d,00,38,00,38,00,1d,00,00,00,00,00
