@@ -93,6 +93,9 @@ namespace KeySwap
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr hwnd);
+
         public static void SendScan(ushort scan, bool up)
         {
             SendBatch(new ScanEvent[] { new ScanEvent(scan, up) });
@@ -148,6 +151,8 @@ namespace KeySwap
         public MainForm()
         {
             Text = "Alt / Ctrl 互换控制";
+            // 关掉自动缩放，改为在 OnLoad 里按实际 DPI 显式缩放整个窗体
+            AutoScaleMode = AutoScaleMode.None;
             ClientSize = new Size(470, 348);
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -429,6 +434,35 @@ namespace KeySwap
         {
             UninstallHook();
             base.OnFormClosing(e);
+        }
+
+        private float _appliedScale = 1f;
+
+        // 用系统 API 取真实 DPI，WinForms 的 DeviceDpi 在部分配置下会返回 96
+        private void ApplyCurrentDpi()
+        {
+            uint dpi = Native.GetDpiForWindow(Handle);
+            if (dpi == 0) return;
+
+            float target = dpi / 96f;
+            float factor = target / _appliedScale;
+            if (Math.Abs(factor - 1f) < 0.01f) return;
+
+            // 只缩放控件几何尺寸；字体点数本身已随 DPI 生效，再乘会双重放大
+            Scale(new SizeF(factor, factor));
+            _appliedScale = target;
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            ApplyCurrentDpi();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ApplyCurrentDpi();
         }
     }
 }
