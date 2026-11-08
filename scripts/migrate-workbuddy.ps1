@@ -3,13 +3,21 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $CandidatePath,
-    [string] $KeySwapPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'dist\KeySwap.exe'),
+    [string] $KeySwapPath = (Join-Path $env:USERPROFILE 'Applications\KeySwap\KeySwap.exe'),
     [string] $LegacyPath = (Join-Path $env:USERPROFILE 'Applications\WorkBuddyAltTab\WorkBuddyAltTabHost.exe'),
     [string] $IntegrationTestPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+foreach ($helper in @('InstallSecurity', 'InstallRuntime')) {
+    if (-not ("KeySwap.Installation.$helper" -as [type])) {
+        Add-Type -Path (Join-Path $PSScriptRoot "$helper.cs")
+    }
+}
+if ([KeySwap.Installation.InstallRuntime]::Inspect($PID).IntegrityRid -lt 12288) {
+    throw 'Migration requires High integrity. An administrator token with a Low integrity label is insufficient.'
+}
 $currentSession = (Get-Process -Id $PID).SessionId
 $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $preferencesKey = 'Software\KeySwap'
@@ -280,6 +288,9 @@ function Test-MergedReady {
     param($Record)
     $process = Get-ValidatedProcess $Record
     if ($null -eq $process) { throw 'Merged KeySwap exited during startup.' }
+    if ([KeySwap.Installation.InstallRuntime]::Inspect($Record.Id).IntegrityRid -lt 12288) {
+        throw 'Merged KeySwap started below High integrity. Use a normal installation directory outside the sandbox workspace.'
+    }
     $current = @(Get-Process -Name 'KeySwap' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $currentSession })
     if ($current.Count -ne 1 -or $current[0].Id -ne $Record.Id -or $current[0].Path -ine $targetExecutable) { return $false }
     if (@(Get-Process -Name 'WorkBuddyAltTabHost' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $currentSession }).Count -ne 0) { return $false }
@@ -304,6 +315,11 @@ function Test-MergedReady {
 $candidateExecutable = Resolve-ExecutablePath $CandidatePath '' -MustExist
 $targetExecutable = Resolve-ExecutablePath $KeySwapPath 'KeySwap.exe'
 $legacyExecutable = Resolve-ExecutablePath $LegacyPath 'WorkBuddyAltTabHost.exe'
+$null = [KeySwap.Installation.InstallSecurity]::ValidateDirectory((Split-Path $targetExecutable -Parent))
+if ((Test-Path -LiteralPath $targetExecutable -PathType Leaf) -and
+    [KeySwap.Installation.InstallSecurity]::GetFileIntegrityRid($targetExecutable) -lt 8192) {
+    throw 'The installed executable has Low integrity. Use scripts/install.ps1 with a clean destination before migration.'
+}
 if ($candidateExecutable -ieq $targetExecutable -or $candidateExecutable -ieq $legacyExecutable) {
     throw 'Stage the candidate in a separate file before migration.'
 }
@@ -402,7 +418,12 @@ try {
     if ((Get-FileHash -LiteralPath $candidateExecutable -Algorithm SHA256).Hash -ne $candidateHash) { throw 'Staged candidate changed after preflight.' }
     New-Item -ItemType Directory -Path (Split-Path $targetExecutable -Parent) -Force | Out-Null
     $targetTouched = $true
-    Copy-Item -LiteralPath $candidateExecutable -Destination $targetExecutable -Force
+    $installStage = [KeySwap.Installation.InstallSecurity]::StageExecutable($candidateExecutable, (Split-Path $targetExecutable -Parent))
+    try { Copy-Item -LiteralPath $installStage -Destination $targetExecutable -Force }
+    finally { [IO.File]::Delete($installStage) }
+    if ([KeySwap.Installation.InstallSecurity]::GetFileIntegrityRid($targetExecutable) -lt 8192) {
+        throw 'Installed candidate inherited Low integrity.'
+    }
     if ((Get-FileHash -LiteralPath $targetExecutable -Algorithm SHA256).Hash -ne $candidateHash) { throw 'Installed candidate checksum mismatch.' }
     $preferencesTouched = $true
     $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($preferencesKey)
